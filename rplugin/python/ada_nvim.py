@@ -1,3 +1,6 @@
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
+
 from collections import defaultdict
 import libadalang as lal
 import logging
@@ -21,6 +24,24 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
 DEBUG = False
+
+
+def log_exceptions(fn):
+    def wrapper(*args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            logger.error('Error in fn {}'.format(fn.__name__), exc_info=True)
+
+    return wrapper
+
+
+# def time_call(fn, call_str=""):
+#     from timeit import default_timer as timer
+#     start = timer()
+#     fn()
+#     end = timer()
+#     logger.info("Call {} took {}ms".format(call_str, end - start))
 
 
 class Cmd(object):
@@ -77,6 +98,12 @@ class Cmd(object):
         return Cmds([str(line_no), Cmd.normal("z."), "redraw!"])
 
     @staticmethod
+    def go_to(line_no, col_no):
+        return Cmds([Cmd.normal("{}z.".format(line_no)),
+                     Cmd.normal("{}|".format(col_no)),
+                     "redraw!"])
+
+    @staticmethod
     def edit_file(file_name):
         """
         Edit given file.
@@ -127,7 +154,7 @@ def vsplit(nvim, new_file=True):
 
 
 @neovim.plugin
-class Main(object):
+class AdaNvim(object):
 
     def __init__(self, vim):
         self.vim = vim
@@ -141,7 +168,7 @@ class Main(object):
             "set splitbelow",
             "set nocursorline",
             "highlight AdaNvimCurrentNode ctermbg=8 guibg=#445555",
-            "highlight AdaNvimOccurences ctermbg=8 guibg=#66EE44",
+            "highlight AdaNvimOccurences ctermbg=9 guibg=#339944",
         ]).run(self.vim)
         self.hl_source = self.vim.new_highlight_source()
 
@@ -180,6 +207,12 @@ class Main(object):
             self.prj_file = config.get('project_file', None)
             self.scenario_variables = config.get('scenario_variables')
 
+        if self.prj_file and not P.isfile(self.prj_file):
+            logger.error(
+                "WARNING: Project file {} does not exist".format(self.prj_file)
+            )
+            self.prj_file = None
+
         if not self.prj_file:
             assert current_file.endswith(('adb', 'ads'))
             self.prj_file = self.create_project_from_file(current_file)
@@ -190,6 +223,9 @@ class Main(object):
 
     def init_ada(self, current_file):
         self.init_config(current_file)
+        logger.info("Creating unit provider with info {} {}".format(
+            self.prj_file, self.scenario_variables
+        ))
         self._lal_context = lal.AnalysisContext(
             unit_provider=lal.UnitProvider.for_project(
                 self.prj_file, self.scenario_variables
@@ -207,6 +243,7 @@ class Main(object):
         return "{}:{}".format(file_name, self.files_versions[file_name])
 
     def get_unit(self, file_name, content=None):
+        logger.info("In get_unit, file_name={}".format(file_name))
         if content:
             self.files_versions[file_name] += 1
             return self.lal_context().get_from_buffer(
@@ -218,7 +255,7 @@ class Main(object):
     def current_unit(self):
         current_file = self.vim.eval('expand("%:p")')
         logger.info("In current_unit, file = {}".format(current_file))
-        if not current_file.endswith(('adb', 'ads')):
+        if not current_file.endswith(('adb', 'ads', 'ada')):
             return
         return self.get_unit(current_file)
 
@@ -240,10 +277,11 @@ class Main(object):
     def autocmd_text_changed(self, file_name):
         logger.info("In autocmd_text_changed for file {}".format(file_name))
         self.ast_current_node = None
-        unit = self.get_unit(file_name, "\n".join(self.vim.current.buffer[:]))
+        unit = self.get_unit(file_name, u"\n".join(self.vim.current.buffer[:]))
         logger.info("New unit's root: {}".format(unit.root))
         if self._ast_shown:
             self.ada_show_ast(reset_current_node=True)
+        _ = self.vim.eval('line(".")')
 
     @neovim.autocmd('CursorMovedI', pattern='*.ad?', eval='expand("%:p")',
                     sync=True)
@@ -267,8 +305,10 @@ class Main(object):
 
         line = self.vim.eval('line(".")')
         col = self.vim.eval('col(".")')
+        logger.info("In Ada get indent node")
         self.vim.command('echo "Loc {} {}"'.format(line, col))
         current_node = unit.root.lookup(lal.Sloc(line, col))
+        logger.info("Current node = {}".format(current_node))
         return current_node
 
     def open_file(self, file_name):
@@ -282,39 +322,47 @@ class Main(object):
         return Cmds([Cmd("vsplit {}".format(file_name))])
 
     @neovim.function('AdaHighlightRefsInFile')
+    @log_exceptions
     def ada_highlight_refs_in_file(self, args):
 
         buf = self.vim.current.buffer
         buf.clear_highlight(self.hl_source)
 
-        logger.info("In ada_go_to_def")
+        logger.info("In ada highlight refs")
         node = self.ada_get_indent_node([])
         logger.info("Node = {}".format(node))
 
         if not node.is_a(lal.BaseId):
             return
 
-        refd = node.p_referenced_decl
-        logger.info("Refd = {}".format(refd))
-        if refd:
+        def_id = node.p_xref(imprecise_fallback=True)
+
+        logger.info("Refd = {}".format(def_id))
+        if def_id:
+            logger.info("def_id.text = {}".format(def_id.text))
             ids = node.unit.root.findall(
                 lambda n: n.is_a(lal.BaseId)
-                and n.text == refd.p_defining_name.text
+                and n.text == def_id.p_relative_name.text
             )
             logger.info("Ids = {}".format(ids))
             f_ids = []
             for id in ids:
                 try:
-                    cur_refd = id.p_referenced_decl
+                    cur_refd = id.p_xref(imprecise_fallback=True)
                 except lal.PropertyError:
                     continue
+
                 logger.info("Id = {}, Cur_Refd = {}, Refd = {}".format(
-                    id, cur_refd, refd
+                    id, cur_refd, def_id
                 ))
-                if cur_refd == refd:
+                if cur_refd == def_id:
                     f_ids.append(id)
 
             logger.info("F_Ids = {}".format(f_ids))
+
+            if def_id.unit.filename == node.unit.filename:
+                f_ids.append(def_id)
+
             for id in f_ids:
                 sl = id.sloc_range
                 buf.add_highlight(
@@ -366,11 +414,12 @@ class Main(object):
         logger.info("In ada_go_to_def")
         node = self.ada_get_indent_node([])
         logger.info("Node = {}".format(node))
-        refd = node.p_referenced_decl
+        refd = node.p_xref(imprecise_fallback=True)
         logger.info("Refd = {}".format(refd))
         if refd:
             cmds = self.open_file(refd.unit.filename)
-            cmds.append(Cmd.center_on_line(refd.sloc_range.start.line))
+            cmds.append(Cmd.go_to(refd.sloc_range.start.line,
+                                  refd.sloc_range.start.column))
             cmds.run(self.vim)
 
     @neovim.function('AdaSelectParentNode')
@@ -426,10 +475,17 @@ class Main(object):
         else:
             current_node = self.ast_current_node
 
+        self.ast_version = self.file_version(current_file)
+
+        if current_node is None:
+            return
+
         erepr = current_node.entity_repr[1:-1]
+        logger.info(erepr)
         ast_line = -1
         for i, l in enumerate(ast_window.buffer[:]):
-            if erepr in l:
+            l = l.decode("unicode-escape")
+            if erepr in unicode(l):
                 ast_line = i + 1
 
         Cmds([
@@ -465,5 +521,3 @@ class Main(object):
             ast_line - 1, 0, -1,
             src_id=self.hl_source
         )
-
-        self.ast_version = self.file_version(current_file)

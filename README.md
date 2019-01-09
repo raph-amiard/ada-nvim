@@ -14,7 +14,13 @@ Key bindings
 <c-a><c-h>: Highlight local references
 <tab>: Indent current line (or selection in visual mode)
 
-How to install
---------------
+How to install using vim plug
+-----------------------------
 
-TODO
+Add
+
+```
+    Plug 'path/to/ada-nvim/'
+```
+
+to your plugin section
